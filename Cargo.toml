@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "shared",
+  "harness",
+  "web-host",
+]
+resolver = "2"
+
+[workspace.dependencies]
+automerge = "0.7.4"
+autosurgeon = "0.10"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+samod = { version = "=0.6.1", features = ["tokio", "tungstenite"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+shared = { path = "shared" }
