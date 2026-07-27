@@ -3399,6 +3399,7 @@ dependencies = [
  "automerge",
  "autosurgeon",
  "futures",
+ "once_cell",
  "samod",
  "serde",
  "serde_json",
