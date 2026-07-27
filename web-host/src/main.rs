@@ -1,9 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-use once_cell::sync::OnceCell;
 use samod::{ConnDirection, DocHandle};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -13,7 +13,6 @@ use wry::WebView;
 
 use shared::{AgentDoc, Observation, RegisteredTool, WebViewStatus, SAMOD_WS_PORT};
 
-static DOC: OnceCell<Mutex<DocHandle>> = OnceCell::new();
 const WEBMCP: &str = include_str!("webmcp.js");
 const BRIDGE: &str = r#"(function(){
 var ipc = window.ipc, aid = window.__a2web.appId;
@@ -31,28 +30,10 @@ enum HostEvent {
     ToolCall { call_id: String, tool_name: String, arguments: String, app_id: String },
 }
 
-fn with_doc<F: FnOnce(&mut AgentDoc)>(f: F) {
-    eprintln!("[web-host] with_doc: DOC={}", DOC.get().is_some());
-    if let Some(d) = DOC.get() {
-        if let Ok(g) = d.lock() {
-            g.with_document(|doc| {
-                use autosurgeon::{hydrate, reconcile};
-                let mut a: AgentDoc = hydrate(doc).unwrap_or_default();
-                f(&mut a);
-                let mut t = doc.transaction();
-                let _ = reconcile(&mut t, &a);
-                t.commit();
-            });
-            eprintln!("[web-host] write done");
-        }
-    } else {
-        eprintln!("[web-host] DOC not set!");
-    }
-}
-
 fn main() {
     let event_loop = EventLoopBuilder::<HostEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let (doc_tx, doc_rx) = std::sync::mpsc::channel::<DocHandle>();
 
     thread::spawn(move || {
         let rt = Runtime::new().unwrap();
@@ -62,7 +43,7 @@ fn main() {
             let ws_url = std::env::var("A2WEB_WS_URL")
                 .unwrap_or_else(|_| format!("ws://127.0.0.1:{SAMOD_WS_PORT}/sync"));
 
-            for i in 0..30 {
+            for _i in 0..30 {
                 if let Ok((s, _)) = tokio_tungstenite::connect_async(&ws_url).await {
                     let _ = repo.connect_tungstenite(s, ConnDirection::Outgoing);
                     break;
@@ -75,7 +56,8 @@ fn main() {
                 if let Ok(Some(h)) = repo.find(pid.clone()).await { break h; }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             };
-            DOC.set(Mutex::new(handle.clone())).ok();
+
+            doc_tx.send(handle.clone()).ok();
 
             use futures::StreamExt;
             let mut changes = handle.changes();
@@ -106,6 +88,8 @@ fn main() {
         });
     });
 
+    let dh = doc_rx.recv().expect("doc handle");
+    let dh = Arc::new(Mutex::new(dh));
     let mut views: HashMap<WindowId, (Window, WebView, String)> = HashMap::new();
 
     event_loop.run(move |event, wt, cf| {
@@ -116,43 +100,65 @@ fn main() {
                 let wid = win.id();
 
                 let wv = WebViewBuilder::new()
-                    .with_ipc_handler(move |req| {
-                        let body = req.body().to_string();
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                            let typ = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                            let aid = v.get("appId").and_then(|x| x.as_str()).unwrap_or("webapp").to_string();
-                            with_doc(|a| match typ {
-                                "tools" => {
-                                    if let Some(tools) = v.get("tools").and_then(|x| x.as_array()) {
-                                        a.registered_tools.retain(|t| t.app_id != aid);
-                                        for tv in tools {
-                                            let n = tv.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                                            if n.is_empty() { continue; }
-                                            a.registered_tools.push(RegisteredTool {
-                                                name: n,
-                                                title: tv.get("title").and_then(|x| x.as_str()).map(String::from),
-                                                description: tv.get("description").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                                                input_schema: tv.get("inputSchema").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                                                app_id: aid.clone(), origin: "app".to_string(),
-                                            });
+                    .with_ipc_handler({
+                        let dh = dh.clone();
+                        move |req| {
+                            let body = req.body().to_string();
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                                let typ = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                                let aid = v.get("appId").and_then(|x| x.as_str()).unwrap_or("webapp").to_string();
+                                if let Ok(g) = dh.lock() {
+                                    g.with_document(|doc| {
+                                        use autosurgeon::{hydrate, reconcile};
+                                        let mut a: AgentDoc = hydrate(doc).unwrap_or_default();
+                                        match typ {
+                                            "tools" => {
+                                                if let Some(tools) = v.get("tools").and_then(|x| x.as_array()) {
+                                                    a.registered_tools.retain(|t| t.app_id != aid);
+                                                    for tv in tools {
+                                                        let n = tv.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                                        if n.is_empty() { continue; }
+                                                        a.registered_tools.push(RegisteredTool {
+                                                            name: n,
+                                                            title: tv.get("title").and_then(|x| x.as_str()).map(String::from),
+                                                            description: tv.get("description").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                                            input_schema: tv.get("inputSchema").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                                            app_id: aid.clone(), origin: "app".to_string(),
+                                                        });
+                                                    }
+                                                    // Emit observation so sub-agents learn about tools
+                                                    let seq = a.observations.len() as u64;
+                                                    if let Ok(tools_json) = serde_json::to_string(&tools) {
+                                                        a.observations.push(Observation {
+                                                            app_id: aid.clone(),
+                                                            data: format!("{{\"type\":\"tools_available\",\"tools\":{}}}", tools_json),
+                                                            label: Some("tools_available".into()),
+                                                            sequence: seq,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            "obs" => {
+                                                let seq = a.observations.len() as u64;
+                                                if let Some(data) = v.get("data") {
+                                                    let d = data.get("data").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                                    let l = data.get("label").and_then(|x| x.as_str()).map(String::from);
+                                                    if !d.is_empty() { a.observations.push(Observation { app_id: aid, data: d, label: l, sequence: seq }); }
+                                                }
+                                            }
+                                            "result" => {
+                                                let seq = a.observations.len() as u64;
+                                                let data = serde_json::to_string(&v).unwrap_or_default();
+                                                a.observations.push(Observation { app_id: aid, data, label: Some("tool_result".into()), sequence: seq });
+                                            }
+                                            _ => {}
                                         }
-                                    }
+                                        let mut t = doc.transaction();
+                                        let _ = reconcile(&mut t, &a);
+                                        t.commit();
+                                    });
                                 }
-                                "obs" => {
-                                    let seq = a.observations.len() as u64;
-                                    if let Some(data) = v.get("data") {
-                                        let d = data.get("data").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                                        let l = data.get("label").and_then(|x| x.as_str()).map(String::from);
-                                        if !d.is_empty() { a.observations.push(Observation { app_id: aid, data: d, label: l, sequence: seq }); }
-                                    }
-                                }
-                                "result" => {
-                                    let seq = a.observations.len() as u64;
-                                    let data = serde_json::to_string(&v).unwrap_or_default();
-                                    a.observations.push(Observation { app_id: aid, data, label: Some("tool_result".into()), sequence: seq });
-                                }
-                                _ => {}
-                            });
+                            }
                         }
                     })
                     .with_html(&format!(
@@ -163,7 +169,16 @@ fn main() {
                     ))
                     .build(&win).unwrap();
 
-                with_doc(|a| { for w in &mut a.webviews { if w.id == id { w.status = WebViewStatus::Launched; } } });
+                if let Ok(g) = dh.lock() {
+                    g.with_document(|doc| {
+                        use autosurgeon::{hydrate, reconcile};
+                        let mut a: AgentDoc = hydrate(doc).unwrap_or_default();
+                        for w in &mut a.webviews { if w.id == id { w.status = WebViewStatus::Launched; } }
+                        let mut t = doc.transaction();
+                        let _ = reconcile(&mut t, &a);
+                        t.commit();
+                    });
+                }
                 views.insert(wid, (win, wv, id));
             }
 
@@ -178,7 +193,17 @@ fn main() {
 
             Event::WindowEvent { event: WindowEvent::CloseRequested, window_id, .. } => {
                 if let Some((_, _, app_id)) = views.remove(&window_id) {
-                    with_doc(|a| { a.webviews.retain(|w| w.id != app_id); a.registered_tools.retain(|t| t.app_id != app_id); });
+                    if let Ok(g) = dh.lock() {
+                        g.with_document(|doc| {
+                            use autosurgeon::{hydrate, reconcile};
+                            let mut a: AgentDoc = hydrate(doc).unwrap_or_default();
+                            a.webviews.retain(|w| w.id != app_id);
+                            a.registered_tools.retain(|t| t.app_id != app_id);
+                            let mut t = doc.transaction();
+                            let _ = reconcile(&mut t, &a);
+                            t.commit();
+                        });
+                    }
                 }
             }
 
