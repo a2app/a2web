@@ -1,2 +1,6 @@
-.pi/
+.pi/*
+!.pi/extensions
+.pi/extensions/*
+!.pi/extensions/a2web
+.pi/extensions/a2web/node_modules
 target
