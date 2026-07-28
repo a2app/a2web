@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
 import { Type } from "typebox";
 import { connectToHarness, sendToHarness, onMessage } from "./doc-bridge.js";
 import { startHarness, stopHarness } from "./harness.js";
@@ -15,17 +19,8 @@ const subSessions = new Map<string, SubSession>();
 // app_id → session_id mapping
 const appSessionMap = new Map<string, string>();
 
-const SUB_AGENT_PROMPT = `You are running in the context of web applications. You receive observations from apps. You have invoke_webapp_tool to call tools that apps register.
-
-RULES:
-1. Act proactively on observations. When you receive an observation about an app's state, consider if you should call a tool on that or another app.
-2. Call tools ONE AT A TIME. After each call, wait for the result observation before calling again.
-3. Use observations to track state. When a goal is reached, stop.
-4. tools_available observations tell you what tools each app provides.
-
-5. IMPORTANT — check_todo: Only mark a todo as done if you have DIRECT EVIDENCE that the task was actually completed (e.g., you observed the counter reach a target value, you received a tool result confirming completion, etc.). NEVER mark a todo as done just because it was added to the list — being added is not evidence of completion.
-
-For example: if you receive a todos_update observation with "increment to 10" and the counter app has an "increment" tool, call increment repeatedly until the counter reaches 10, then use check_todo to mark it done.`;
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SUB_AGENT_PROMPT = readFileSync(join(__dirname, "sub-agent-prompt.md"), "utf-8");
 
 async function forwardObservationToSubAgent(sessionId: string, appId: string, data: string, label: string | null): Promise<void> {
   const stored = subSessions.get(sessionId);
