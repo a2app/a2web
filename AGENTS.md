@@ -156,3 +156,86 @@ cargo build -p shared -p harness -p web-host
 ```
 
 Only the Rust crates need building. The extension is TypeScript, loaded directly by pi.
+
+---
+
+## Lessons Learned & Best Patterns
+
+### 1. HTML Content Must Be Body-Only
+
+The web-host wraps app HTML inside a full document template:
+```rust
+.with_html(&format!(
+    r#"...<body>{}</body>..."#, html
+))
+```
+**Always pass only body content** — no `<html>`, `<head>`, or `<body>` tags. The polyfill and bridge scripts are already injected before your content.
+
+### 2. CRDT Change Loop Race Condition
+
+The web-host watches CRDT changes in a background tokio thread and sends `WebAppLaunch` events to the main tao event loop. Because `proxy.send_event()` is asynchronous, the changes loop can fire again (from CRDT sync activity) **before** the main thread processes the event and sets the webview status to `Launched`. This causes duplicate windows.
+
+**Fix:** Track dispatched app_ids in a shared `Arc<Mutex<HashSet<String>>>`:
+```rust
+let pending_launches: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+let pl = pending_launches.clone();
+
+// In changes loop:
+for w in &a.webviews {
+    if w.status == WebViewStatus::Pending && !pl_guard.contains(&w.id) {
+        pl_guard.insert(w.id.clone());
+        proxy.send_event(HostEvent::WebAppLaunch { ... });
+    }
+}
+
+// In WebAppLaunch handler, after successful launch:
+pending_launches.lock().unwrap().remove(&id);
+```
+
+### 3. Sub-Agent Prompt Must Constrain Tool Usage
+
+The sub-agent acts proactively on observations. Without explicit constraints, it may misuse tools.
+
+**Problem:** Sub-agent marked todos as done immediately when they were added, because it interpreted the "added" observation as an event it should act on.
+
+**Fix (two layers):**
+1. **Sub-agent system prompt** (`tools.ts`): Add explicit rules about when tools may be used.
+2. **Tool description** (in the app's `registerTool` call): Reinforce the same constraint so it's visible in the tool's metadata.
+
+Both layers are important — the prompt sets general behavior, the tool description provides specific per-tool guidance.
+
+### 4. Extension Changes Require Pi Reload
+
+The extension TypeScript is loaded by pi at startup via `tsx`. Unlike the Rust binaries, changes to `.ts` files in `.pi/extensions/a2web/` require **`/reload`** in pi to take effect. Rust binaries are rebuilt fresh each time the harness spawns the web-host.
+
+### 5. CRDT Uses InMemoryStorage by Default
+
+`samod::Repo::build_tokio()` uses `InMemoryStorage` — no filesystem persistence. Data is lost when the harness process dies. This is fine for development but means:
+- Killing and restarting the harness gives a **fresh document**
+- Old web-host processes (from before the restart) become orphaned with stale data connections
+- Always `killall -9 harness web-host` before restarting to avoid orphan windows
+
+### 6. Process Cleanup
+
+```bash
+# Full cleanup before restart
+killall -9 harness web-host
+# Also free ports
+lsof -ti:2341 | xargs kill -9
+lsof -ti:2342 | xargs kill -9
+```
+
+`pkill -f` is unreliable because it may miss some process paths. Use `killall` by exact binary name. Always verify with `ps` and `lsof`.
+
+### 7. Observation Handling in Web-Host IPC
+
+The web-host's IPC handler receives `obs` messages with a nested structure:
+```rust
+"obs" => {
+    if let Some(data) = v.get("data") {
+        let d = data.get("data").and_then(|x| x.as_str())...
+        let l = data.get("label").and_then(|x| x.as_str())...
+    }
+}
+```
+The inner `data` and `label` come from the polyfill's `sendObservation(data, label)` — the outer `data` is the IPC message body.

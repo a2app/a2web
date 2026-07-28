@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -35,6 +35,8 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let (doc_tx, doc_rx) = std::sync::mpsc::channel::<DocHandle>();
 
+    let pending_launches: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let pl = pending_launches.clone();
     thread::spawn(move || {
         let rt = Runtime::new().unwrap();
         rt.block_on(async move {
@@ -65,7 +67,9 @@ fn main() {
                 handle.with_document(|doc| {
                     use autosurgeon::hydrate;
                     let a: AgentDoc = hydrate(doc).unwrap_or_default();
-                    for w in &a.webviews { if w.status == WebViewStatus::Pending {
+                    let mut pl_guard = pl.lock().unwrap();
+                    for w in &a.webviews { if w.status == WebViewStatus::Pending && !pl_guard.contains(&w.id) {
+                        pl_guard.insert(w.id.clone());
                         let _ = proxy.send_event(HostEvent::WebAppLaunch { id: w.id.clone(), html: w.html.clone() });
                     }}
                     for tc in &a.tool_calls {
@@ -179,6 +183,7 @@ fn main() {
                         t.commit();
                     });
                 }
+                pending_launches.lock().unwrap().remove(&id);
                 views.insert(wid, (win, wv, id));
             }
 
