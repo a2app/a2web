@@ -26,8 +26,16 @@ window.__a2web.onToolCall = async function(c,t,a,r) {
 
 #[derive(Debug)]
 enum HostEvent {
-    WebAppLaunch { id: String, html: String },
-    ToolCall { call_id: String, tool_name: String, arguments: String, app_id: String },
+    WebAppLaunch {
+        id: String,
+        html: String,
+    },
+    ToolCall {
+        call_id: String,
+        tool_name: String,
+        arguments: String,
+        app_id: String,
+    },
 }
 
 fn main() {
@@ -55,7 +63,9 @@ fn main() {
 
             let pid: samod::DocumentId = doc_id.parse().expect("doc id");
             let handle = loop {
-                if let Ok(Some(h)) = repo.find(pid.clone()).await { break h; }
+                if let Ok(Some(h)) = repo.find(pid.clone()).await {
+                    break h;
+                }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             };
 
@@ -68,21 +78,29 @@ fn main() {
                     use autosurgeon::hydrate;
                     let a: AgentDoc = hydrate(doc).unwrap_or_default();
                     let mut pl_guard = pl.lock().unwrap();
-                    for w in &a.webviews { if w.status == WebViewStatus::Pending && !pl_guard.contains(&w.id) {
-                        pl_guard.insert(w.id.clone());
-                        let _ = proxy.send_event(HostEvent::WebAppLaunch { id: w.id.clone(), html: w.html.clone() });
-                    }}
+                    for w in &a.webviews {
+                        if w.status == WebViewStatus::Pending && !pl_guard.contains(&w.id) {
+                            pl_guard.insert(w.id.clone());
+                            let _ = proxy.send_event(HostEvent::WebAppLaunch {
+                                id: w.id.clone(),
+                                html: w.html.clone(),
+                            });
+                        }
+                    }
                     for tc in &a.tool_calls {
                         let _ = proxy.send_event(HostEvent::ToolCall {
-                            call_id: tc.id.clone(), tool_name: tc.tool_name.clone(),
-                            arguments: tc.arguments.clone(), app_id: tc.app_id.clone(),
+                            call_id: tc.id.clone(),
+                            tool_name: tc.tool_name.clone(),
+                            arguments: tc.arguments.clone(),
+                            app_id: tc.app_id.clone(),
                         });
                     }
                 });
                 handle.with_document(|doc| {
                     use autosurgeon::{hydrate, reconcile};
                     let mut a: AgentDoc = hydrate(doc).unwrap_or_default();
-                    if !a.tool_calls.is_empty() { a.tool_calls.clear();
+                    if !a.tool_calls.is_empty() {
+                        a.tool_calls.clear();
                         let mut t = doc.transaction();
                         let _ = reconcile(&mut t, &a);
                         t.commit();
