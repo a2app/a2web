@@ -192,17 +192,25 @@ for w in &a.webviews {
 pending_launches.lock().unwrap().remove(&id);
 ```
 
-### 3. Sub-Agent Prompt Must Constrain Tool Usage
+### 3. Where to Put Behavior Constraints: Prompt vs Tool Descriptions
 
-The sub-agent acts proactively on observations. Without explicit constraints, it may misuse tools.
+The sub-agent acts proactively on observations. Without proper constraints, it may misuse tools (e.g., marking a todo as done as soon as it's added).
 
-**Problem:** Sub-agent marked todos as done immediately when they were added, because it interpreted the "added" observation as an event it should act on.
+**Key insight:** The sub-agent system prompt and the tool descriptions serve different roles:
 
-**Fix (two layers):**
-1. **Sub-agent system prompt** (`tools.ts`): Add explicit rules about when tools may be used.
-2. **Tool description** (in the app's `registerTool` call): Reinforce the same constraint so it's visible in the tool's metadata.
+1. **Sub-agent system prompt** (`sub-agent-prompt.md`): Keep it **generic**. Only include operational rules:
+   - Read observations carefully
+   - Call tools one at a time, wait for results
+   - Use observations to track state
+   - Follow each tool's description for when to use it
 
-Both layers are important — the prompt sets general behavior, the tool description provides specific per-tool guidance.
+2. **Tool descriptions** (in each app's `registerTool` call): Encode **app-specific** behavior here. The tool description is what the agent reads when deciding whether to call a tool:
+   - *Increment tool:* "If the user adds a todo asking to reach a target number, call this repeatedly until the target is met."
+   - *Check todo tool:* "Only call this after a separate observation or tool result confirmed the task was actually completed — the observation that the todo was added is not evidence of completion."
+
+**Why this works:** The `tools_available` observation lists every registered tool with its full description. The agent sees constraints inline with each tool — it doesn't need abstract rules in the prompt that may or may not apply to a particular tool.
+
+**Anti-pattern:** Putting app-specific rules in the sub-agent prompt (e.g., "never mark a todo as done just because it was added"). This couples the prompt to specific apps and doesn't scale.
 
 ### 4. Extension Changes Require Pi Reload
 
