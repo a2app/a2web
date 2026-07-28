@@ -1,0 +1,249 @@
+# A2Web — Web App Agent System
+
+Pi launches web apps in native webviews. Apps register tools and send observations via the [WebMCP](https://webmachinelearning.github.io/webmcp/) polyfill. Observations are forwarded to sub-agents that proactively act on them.
+
+## Quick Start
+
+```bash
+# 1. Build Rust binaries
+cargo build -p shared -p harness -p web-host
+
+# 2. Install extension deps
+cd .pi/extensions/a2web && npm install && cd ../..
+
+# 3. Run pi in this directory
+pi
+```
+
+## Architecture
+
+```
+┌──────────────┐    JSON WS      ┌──────────┐    samod CRDT    ┌──────────┐   wry    ┌───────────┐
+│  Pi Agent    │◄──────────────►│  Harness  │◄──────────────►│ Web Host │◄───────►│ Webviews  │
+│  + Extension │   port 2341    │  (Rust)  │   port 2342    │  (Rust)  │         │ (w/WebMCP)│
+└──────┬───────┘                └──────────┘                └──────────┘         └───────────┘
+       │
+       │ observations forwarded
+       ▼
+┌──────────────┐
+│ Sub-Agent    │  (pi SDK AgentSession)
+│ session      │  proactively invokes tools
+└──────────────┘
+```
+
+### Components
+
+**Pi Extension** (`.pi/extensions/a2web/`)
+- Registers `start_sub_agent`, `launch_webview`, `invoke_webapp_tool`
+- Creates sub-agent sessions via `createAgentSession()` from pi SDK
+- Forwards observations from webviews to linked sub-agents
+- Cleans up sessions and processes on shutdown
+
+**Harness** (`harness/`)
+- Rust binary bridging pi ↔ web-host
+- JSON WebSocket server (port 2341) for pi extension
+- samod CRDT WebSocket server (port 2342) for web-host sync
+- Bridge loop: watches CRDT changes, forwards new observations to pi
+
+**Web Host** (`web-host/`)
+- Rust binary using wry + tao for native webview windows
+- Injects WebMCP polyfill + bridge JS into every webview
+- Handles IPC from webview JS: tool registration, observations, tool results
+- Writes all data to the shared CRDT document
+
+**WebMCP Polyfill** (`web-host/src/webmcp.js`)
+- Implements `document.modelContext` per the WebMCP spec
+- `registerTool({name, description, inputSchema, execute})` — registers a tool
+- `sendObservation(data, label)` — sends observation to the agent
+- `getTools()` — lists registered tools
+- Tool results are sent back as `tool_result` observations
+
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| `start_sub_agent` | Creates a sub-agent session with `invoke_webapp_tool`. Returns `session_id`. |
+| `launch_webview` | Launches a web app in a native webview. Optional `session_id` links it to a sub-agent. |
+| `invoke_webapp_tool` | Calls a tool registered by a web app. Provide `app_id`, `tool_name`, `arguments`. |
+
+## Sub-Agent
+
+Created with `start_sub_agent`. The sub-agent:
+- Has `invoke_webapp_tool` registered to call tools on webviews
+- Receives observations automatically via `session.prompt()` with `followUp` behavior
+- Is told to act proactively: on receiving an observation, assess it and invoke tools as needed
+- Calls tools ONE AT A TIME, waiting for the result observation before proceeding
+
+## Data Flow
+
+```
+1. App loads → registerTool() → ipc.postMessage('tools') 
+   → web-host writes to CRDT → tools_available observation emitted
+
+2. User interacts → sendObservation() → ipc.postMessage('obs')
+   → web-host writes to CRDT → samod sync → harness
+   → JSON WS → pi extension → forwardObservationToSubAgent()
+   → sub-agent session.prompt()
+
+3. Sub-agent decides → invoke_webapp_tool({app_id, tool_name, args})
+   → extension sends to harness → CRDT → web-host
+   → evaluate_script() → polyfill._executeTool() 
+   → result sent back as tool_result observation
+
+4. Tool result observation → forwarded to sub-agent (same path)
+   → sub-agent sees result, decides next action
+```
+
+## Session Cleanup
+
+On `session_shutdown`:
+1. Send `exit` message to harness
+2. `disposeAllSessions()` — disposes all sub-agent sessions
+3. `stopHarness()` — kills harness + orphan web-host processes
+
+## Ports
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 2341 | JSON WebSocket | Pi extension ↔ Harness |
+| 2342 | samod CRDT WebSocket | Harness ↔ Web Host |
+
+## Project Structure
+
+```
+a2web/
+  AGENTS.md
+  Cargo.toml                 # Rust workspace
+  shared/src/lib.rs          # CRDT document types (AgentDoc)
+  harness/src/main.rs        # Bridge: pi JSON WS + samod CRDT server
+  web-host/
+    src/main.rs              # wry/tao webview host
+    src/webmcp.js            # WebMCP polyfill injected into webviews
+  .pi/extensions/a2web/
+    index.ts                 # Extension entry: registers tools, lifecycle
+    tools.ts                 # Tool implementations + sub-agent system
+    types.ts                 # TypeScript types for harness messages
+    doc-bridge.ts            # WebSocket connection to harness
+    harness.ts               # Harness process management
+```
+
+## Example Session
+
+```
+1. /reload
+2. start_sub_agent session_id="demo-session"
+3. launch_webview app_id="counter" html="..." session_id="demo-session"
+4. launch_webview app_id="todos" html="..." session_id="demo-session"
+5. [User adds "increment to 10" to todos]
+6. Sub-agent sees todos_update observation, calls increment repeatedly
+7. Counter reaches 10, sub-agent stops
+```
+
+## WebMCP Reference
+
+Based on [WebMCP spec](https://webmachinelearning.github.io/webmcp/) (2026-07-21):
+
+- `document.modelContext` — exposed on every webview's Document
+- `registerTool(tool, options?)` — registers a tool with name, description, inputSchema, execute
+- `getTools(options?)` — lists registered tools from this frame tree
+- `sendObservation(data, label?)` — A2Web extension: sends observation to the agent
+- `ontoolchange` event — fired when tools are added/removed
+
+## Build
+
+```bash
+cargo build -p shared -p harness -p web-host
+```
+
+Only the Rust crates need building. The extension is TypeScript, loaded directly by pi.
+
+---
+
+## Lessons Learned & Best Patterns
+
+### 1. HTML Content Must Be Body-Only
+
+The web-host wraps app HTML inside a full document template:
+```rust
+.with_html(&format!(
+    r#"...<body>{}</body>..."#, html
+))
+```
+**Always pass only body content** — no `<html>`, `<head>`, or `<body>` tags. The polyfill and bridge scripts are already injected before your content.
+
+### 2. CRDT Change Loop Race Condition
+
+The web-host watches CRDT changes in a background tokio thread and sends `WebAppLaunch` events to the main tao event loop. Because `proxy.send_event()` is asynchronous, the changes loop can fire again (from CRDT sync activity) **before** the main thread processes the event and sets the webview status to `Launched`. This causes duplicate windows.
+
+**Fix:** Track dispatched app_ids in a shared `Arc<Mutex<HashSet<String>>>`:
+```rust
+let pending_launches: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+let pl = pending_launches.clone();
+
+// In changes loop:
+for w in &a.webviews {
+    if w.status == WebViewStatus::Pending && !pl_guard.contains(&w.id) {
+        pl_guard.insert(w.id.clone());
+        proxy.send_event(HostEvent::WebAppLaunch { ... });
+    }
+}
+
+// In WebAppLaunch handler, after successful launch:
+pending_launches.lock().unwrap().remove(&id);
+```
+
+### 3. Where to Put Behavior Constraints: Prompt vs Tool Descriptions
+
+The sub-agent acts proactively on observations. Without proper constraints, it may misuse tools (e.g., marking a todo as done as soon as it's added).
+
+**Key insight:** The sub-agent system prompt and the tool descriptions serve different roles:
+
+1. **Sub-agent system prompt** (`sub-agent-prompt.md`): Keep it **generic**. Only include operational rules:
+   - Read observations carefully
+   - Call tools one at a time, wait for results
+   - Use observations to track state
+   - Follow each tool's description for when to use it
+
+2. **Tool descriptions** (in each app's `registerTool` call): Encode **app-specific** behavior here. The tool description is what the agent reads when deciding whether to call a tool:
+   - *Increment tool:* "If the user adds a todo asking to reach a target number, call this repeatedly until the target is met."
+   - *Check todo tool:* "Only call this after a separate observation or tool result confirmed the task was actually completed — the observation that the todo was added is not evidence of completion."
+
+**Why this works:** The `tools_available` observation lists every registered tool with its full description. The agent sees constraints inline with each tool — it doesn't need abstract rules in the prompt that may or may not apply to a particular tool.
+
+**Anti-pattern:** Putting app-specific rules in the sub-agent prompt (e.g., "never mark a todo as done just because it was added"). This couples the prompt to specific apps and doesn't scale.
+
+### 4. Extension Changes Require Pi Reload
+
+The extension TypeScript is loaded by pi at startup via `tsx`. Unlike the Rust binaries, changes to `.ts` files in `.pi/extensions/a2web/` require **`/reload`** in pi to take effect. Rust binaries are rebuilt fresh each time the harness spawns the web-host.
+
+### 5. CRDT Uses InMemoryStorage by Default
+
+`samod::Repo::build_tokio()` uses `InMemoryStorage` — no filesystem persistence. Data is lost when the harness process dies. This is fine for development but means:
+- Killing and restarting the harness gives a **fresh document**
+- Old web-host processes (from before the restart) become orphaned with stale data connections
+- Always `killall -9 harness web-host` before restarting to avoid orphan windows
+
+### 6. Process Cleanup
+
+```bash
+# Full cleanup before restart
+killall -9 harness web-host
+# Also free ports
+lsof -ti:2341 | xargs kill -9
+lsof -ti:2342 | xargs kill -9
+```
+
+`pkill -f` is unreliable because it may miss some process paths. Use `killall` by exact binary name. Always verify with `ps` and `lsof`.
+
+### 7. Observation Handling in Web-Host IPC
+
+The web-host's IPC handler receives `obs` messages with a nested structure:
+```rust
+"obs" => {
+    if let Some(data) = v.get("data") {
+        let d = data.get("data").and_then(|x| x.as_str())...
+        let l = data.get("label").and_then(|x| x.as_str())...
+    }
+}
+```
+The inner `data` and `label` come from the polyfill's `sendObservation(data, label)` — the outer `data` is the IPC message body.
