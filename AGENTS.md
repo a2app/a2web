@@ -1,6 +1,6 @@
-# A2Web — Web App Agent System
+# A2Web — Web App Intent System
 
-Pi launches web apps in native webviews. Apps register tools and send observations via the [WebMCP](https://webmachinelearning.github.io/webmcp/) polyfill. Observations are forwarded to sub-agents that proactively act on them.
+Pi launches web apps in native webviews. Apps communicate through **intents** — typed, schematized data they register as available (`registerIntent(type, id)`). Intent registrations (type + id only) are injected into the **main agent's** context; content stays app-side and is read/written/moved through dedicated tools.
 
 ## Quick Start
 
@@ -13,6 +13,8 @@ cd .pi/extensions/a2web && npm install && cd ../..
 
 # 3. Run pi in this directory
 pi
+
+# 4. Launch apps and transfer notes between them
 ```
 
 ## Architecture
@@ -21,84 +23,84 @@ pi
 ┌──────────────┐    JSON WS      ┌──────────┐    samod CRDT    ┌──────────┐   wry    ┌───────────┐
 │  Pi Agent    │◄──────────────►│  Harness  │◄──────────────►│ Web Host │◄───────►│ Webviews  │
 │  + Extension │   port 2341    │  (Rust)  │   port 2342    │  (Rust)  │         │ (w/WebMCP)│
-└──────┬───────┘                └──────────┘                └──────────┘         └───────────┘
+└──────────────┘                └──────────┘                └──────────┘         └───────────┘
        │
-       │ observations forwarded
+       │ intent_registered / intent_response
        ▼
-┌──────────────┐
-│ Sub-Agent    │  (pi SDK AgentSession)
-│ session      │  proactively invokes tools
-└──────────────┘
+  main agent context (pi.sendMessage, followUp + triggerTurn)
 ```
 
 ### Components
 
 **Pi Extension** (`.pi/extensions/a2web/`)
-- Registers `start_sub_agent`, `launch_webview`, `invoke_webapp_tool`
-- Creates sub-agent sessions via `createAgentSession()` from pi SDK
-- Forwards observations from webviews to linked sub-agents
-- Cleans up sessions and processes on shutdown
+- Registers `launch_webview`, `get_intent`, `set_intent`, `send_intent_to`
+- On `intent_registered` / `intent_unregistered` messages from the harness, injects
+  `[A2Web] Intent registered — app: <app>, type: <type>, id: <id>` into the **main agent's**
+  context via `pi.sendMessage(..., { deliverAs: "followUp", triggerTurn: true })`
+- Keeps a mirror registry (`app_id → intent_id → type`) for fail-fast validation of tool calls
 
 **Harness** (`harness/`)
-- Rust binary bridging pi ↔ web-host
-- JSON WebSocket server (port 2341) for pi extension
-- samod CRDT WebSocket server (port 2342) for web-host sync
-- Bridge loop: watches CRDT changes, forwards new observations to pi
+- Rust binary bridging pi ↔ web-host: JSON WebSocket (port 2341) + samod CRDT sync (port 2342)
+- Writes `intent_ops` into the CRDT when pi calls a tool; forwards new
+  `intent_registrations` / `intent_unregistrations` / `intent_responses` back to pi
 
 **Web Host** (`web-host/`)
-- Rust binary using wry + tao for native webview windows
-- Injects WebMCP polyfill + bridge JS into every webview
-- Handles IPC from webview JS: tool registration, observations, tool results
-- Writes all data to the shared CRDT document
+- Rust binary using wry + tao for native webview windows; injects the WebMCP polyfill + bridge JS
+- Owns the intent **registry** (`a.intents`) and validates every op against it
+- Fires `intent-request` / `intent-receive` events into webviews; relays transfer content
+  app-to-app **without it ever entering the agent context**
 
 **WebMCP Polyfill** (`web-host/src/webmcp.js`)
-- Implements `document.modelContext` per the WebMCP spec
-- `registerTool({name, description, inputSchema, execute})` — registers a tool
-- `sendObservation(data, label)` — sends observation to the agent
-- `getTools()` — lists registered tools
-- Tool results are sent back as `tool_result` observations
+- `document.modelContext.registerIntent(type, id)` / `unregisterIntent(type, id)` — announces
+  `{type, id}` to the system; validates against the known intent schemes (only `notes` for now)
+- `sendIntent(type, id, data, requestId)` — app's response to an `intent-request` event
+- `getIntent(type, id)` / `setIntent(type, id, data)` — app-local content store (never announced)
+- Events the system fires into the app:
+  - `intent-request` `{requestId, type, id}` — app must respond via `sendIntent`
+  - `intent-receive` `{type, id, data, source}` — system delivers content (`source: "agent" | "transfer"`)
+
+## Intent Schemes
+
+Only one intent type exists today: **`notes`** = `{ id: string, title: string, content: string }`.
+- Registration only carries `{type, id}` — never content.
+- Content is validated/normalized against the scheme (id field filled automatically).
+- `send_intent_to` clones content between apps of the **same type**; the cloned intent keeps
+  the source's id and is announced as a new registration in the target app.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `start_sub_agent` | Creates a sub-agent session with `invoke_webapp_tool`. Returns `session_id`. |
-| `launch_webview` | Launches a web app in a native webview. Optional `session_id` links it to a sub-agent. |
-| `invoke_webapp_tool` | Calls a tool registered by a web app. Provide `app_id`, `tool_name`, `arguments`. |
-
-## Sub-Agent
-
-Created with `start_sub_agent`. The sub-agent:
-- Has `invoke_webapp_tool` registered to call tools on webviews
-- Receives observations automatically via `session.prompt()` with `followUp` behavior
-- Is told to act proactively: on receiving an observation, assess it and invoke tools as needed
-- Calls tools ONE AT A TIME, waiting for the result observation before proceeding
+| `launch_webview` | Launches a web app in a native webview. |
+| `get_intent` | Reads an intent's content (`app`, `id`). Only when the user asks to read. |
+| `set_intent` | Writes content into an intent (`app`, `id`, `content`). Only when the user asks to write. |
+| `send_intent_to` | Clones content app-to-app (`src_app`, `id`, `target_app`). Content never shown to the agent. |
 
 ## Data Flow
 
 ```
-1. App loads → registerTool() → ipc.postMessage('tools') 
-   → web-host writes to CRDT → tools_available observation emitted
+1. App loads → registerIntent('notes', id) → ipc.postMessage('intent')
+   → web-host validates + writes CRDT (intents + intent_registrations)
+   → harness forwards intent_registered → extension injects into main agent context
 
-2. User interacts → sendObservation() → ipc.postMessage('obs')
-   → web-host writes to CRDT → samod sync → harness
-   → JSON WS → pi extension → forwardObservationToSubAgent()
-   → sub-agent session.prompt()
+2. Agent calls get_intent / send_intent_to
+   → extension sends intent_op → harness writes CRDT (intent_ops)
+   → web-host validates against registry, fires 'intent-request' into the source app
+   → app responds: sendIntent(type, id, data, requestId) → ipc.postMessage('intent-content')
 
-3. Sub-agent decides → invoke_webapp_tool({app_id, tool_name, args})
-   → extension sends to harness → CRDT → web-host
-   → evaluate_script() → polyfill._executeTool() 
-   → result sent back as tool_result observation
+3. get:  web-host writes intent_response {kind: get, data} → harness → extension resolves tool
+   set:  web-host fires 'intent-receive' {source: agent} into the app → writes response
+   transfer: web-host fires 'intent-receive' {source: transfer} into the target app
+            → writes response + a new intent_registration for the target (same id)
 
-4. Tool result observation → forwarded to sub-agent (same path)
-   → sub-agent sees result, decides next action
+4. intent_response → forwarded to pi → extension resolves the awaiting tool call
 ```
 
 ## Session Cleanup
 
 On `session_shutdown`:
 1. Send `exit` message to harness
-2. `disposeAllSessions()` — disposes all sub-agent sessions
+2. `disposeExtensionState()` — clears the registry
 3. `stopHarness()` — kills harness + orphan web-host processes
 
 ## Ports
@@ -112,16 +114,16 @@ On `session_shutdown`:
 
 ```
 a2web/
-  AGENTS.md
+  AGENTS.md                  # Architecture, tools, data flow, patterns
   Cargo.toml                 # Rust workspace
-  shared/src/lib.rs          # CRDT document types (AgentDoc)
+  shared/src/lib.rs          # CRDT document types (AgentDoc) + intent scheme validation
   harness/src/main.rs        # Bridge: pi JSON WS + samod CRDT server
   web-host/
-    src/main.rs              # wry/tao webview host
+    src/main.rs              # wry/tao webview host + intent op routing
     src/webmcp.js            # WebMCP polyfill injected into webviews
   .pi/extensions/a2web/
-    index.ts                 # Extension entry: registers tools, lifecycle
-    tools.ts                 # Tool implementations + sub-agent system
+    index.ts                 # Extension entry: tools, lifecycle, context injection
+    tools.ts                 # Tool implementations + intent registry
     types.ts                 # TypeScript types for harness messages
     doc-bridge.ts            # WebSocket connection to harness
     harness.ts               # Harness process management
@@ -131,23 +133,13 @@ a2web/
 
 ```
 1. /reload
-2. start_sub_agent session_id="demo-session"
-3. launch_webview app_id="counter" html="..." session_id="demo-session"
-4. launch_webview app_id="todos" html="..." session_id="demo-session"
-5. [User adds "increment to 10" to todos]
-6. Sub-agent sees todos_update observation, calls increment repeatedly
-7. Counter reaches 10, sub-agent stops
+2. launch_webview app_id="notes-source" html="<textarea id='note'>...</textarea><script>...registerIntent('notes','note-1')...</script>"
+3. launch_webview app_id="notes-inbox" html="...registerIntent('notes','inbox')..."
+4. [Agent context gets: Intent registered — app: notes-source, type: notes, id: note-1]
+5. User asks: "transfer the note to the inbox"
+6. Agent calls send_intent_to({src_app: notes-source, id: note-1, target_app: notes-inbox})
+7. Content moves app-to-app; context gets: Intent registered — app: notes-inbox, type: notes, id: note-1
 ```
-
-## WebMCP Reference
-
-Based on [WebMCP spec](https://webmachinelearning.github.io/webmcp/) (2026-07-21):
-
-- `document.modelContext` — exposed on every webview's Document
-- `registerTool(tool, options?)` — registers a tool with name, description, inputSchema, execute
-- `getTools(options?)` — lists registered tools from this frame tree
-- `sendObservation(data, label?)` — A2Web extension: sends observation to the agent
-- `ontoolchange` event — fired when tools are added/removed
 
 ## Build
 
@@ -171,54 +163,43 @@ The web-host wraps app HTML inside a full document template:
 ```
 **Always pass only body content** — no `<html>`, `<head>`, or `<body>` tags. The polyfill and bridge scripts are already injected before your content.
 
-### 2. CRDT Change Loop Race Condition
+### 2. CRDT Change Stream Only Emits Future Changes
 
-The web-host watches CRDT changes in a background tokio thread and sends `WebAppLaunch` events to the main tao event loop. Because `proxy.send_event()` is asynchronous, the changes loop can fire again (from CRDT sync activity) **before** the main thread processes the event and sets the webview status to `Launched`. This causes duplicate windows.
+`DocHandle::changes()` in samod does **not** replay the current document state. If an op or
+launch lands in the CRDT before the web-host subscribes to changes, it is silently missed —
+the web-host never reads the doc again. This manifests as "app never launches" or "tool
+hangs" when the extension starts the harness and immediately launches apps.
 
-**Fix:** Track dispatched app_ids in a shared `Arc<Mutex<HashSet<String>>>`:
+**Fix:** scan the current document state once after connecting, then rescan on every change:
 ```rust
-let pending_launches: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-let pl = pending_launches.clone();
-
-// In changes loop:
-for w in &a.webviews {
-    if w.status == WebViewStatus::Pending && !pl_guard.contains(&w.id) {
-        pl_guard.insert(w.id.clone());
-        proxy.send_event(HostEvent::WebAppLaunch { ... });
-    }
-}
-
-// In WebAppLaunch handler, after successful launch:
-pending_launches.lock().unwrap().remove(&id);
+let mut changes = handle.changes();
+let scan = || { /* launch pending webviews + dispatch intent ops */ };
+scan();  // initial scan — critical
+while let Some(_) = changes.next().await { scan(); }
 ```
+The `pending_launches` / `pending_ops` guards make the rescan idempotent.
 
-### 3. Where to Put Behavior Constraints: Prompt vs Tool Descriptions
+### 3. Where to Put Behavior Constraints: Agent Addendum vs Tool Descriptions
 
-The sub-agent acts proactively on observations. Without proper constraints, it may misuse tools (e.g., marking a todo as done as soon as it's added).
+The main-agent addendum (`agent-addendum.md`) stays **generic** — operational rules only:
+- Track intents from the `Intent registered` messages in context
+- Only access/move intent content when the user actually asks
+- Don't peek at content before a transfer — `send_intent_to` handles it without exposure
 
-**Key insight:** The sub-agent system prompt and the tool descriptions serve different roles:
-
-1. **Sub-agent system prompt** (`sub-agent-prompt.md`): Keep it **generic**. Only include operational rules:
-   - Read observations carefully
-   - Call tools one at a time, wait for results
-   - Use observations to track state
-   - Follow each tool's description for when to use it
-
-2. **Tool descriptions** (in each app's `registerTool` call): Encode **app-specific** behavior here. The tool description is what the agent reads when deciding whether to call a tool:
-   - *Increment tool:* "If the user adds a todo asking to reach a target number, call this repeatedly until the target is met."
-   - *Check todo tool:* "Only call this after a separate observation or tool result confirmed the task was actually completed — the observation that the todo was added is not evidence of completion."
-
-**Why this works:** The `tools_available` observation lists every registered tool with its full description. The agent sees constraints inline with each tool — it doesn't need abstract rules in the prompt that may or may not apply to a particular tool.
-
-**Anti-pattern:** Putting app-specific rules in the sub-agent prompt (e.g., "never mark a todo as done just because it was added"). This couples the prompt to specific apps and doesn't scale.
+App-specific behavior belongs in each app's event handlers and in what the app stores
+app-side. The agent's tools are the only interface; their descriptions carry the
+when-to-use rules (get/set only on explicit ask, transfer never exposes content).
 
 ### 4. Extension Changes Require Pi Reload
 
-The extension TypeScript is loaded by pi at startup via `tsx`. Unlike the Rust binaries, changes to `.ts` files in `.pi/extensions/a2web/` require **`/reload`** in pi to take effect. Rust binaries are rebuilt fresh each time the harness spawns the web-host.
+The extension TypeScript is loaded by pi at startup via `tsx`. Unlike the Rust binaries,
+changes to `.ts` files in `.pi/extensions/a2web/` require **`/reload`** in pi to take effect.
+Rust binaries are rebuilt fresh each time the harness spawns the web-host.
 
 ### 5. CRDT Uses InMemoryStorage by Default
 
-`samod::Repo::build_tokio()` uses `InMemoryStorage` — no filesystem persistence. Data is lost when the harness process dies. This is fine for development but means:
+`samod::Repo::build_tokio()` uses `InMemoryStorage` — no filesystem persistence. Data is
+lost when the harness process dies. This is fine for development but means:
 - Killing and restarting the harness gives a **fresh document**
 - Old web-host processes (from before the restart) become orphaned with stale data connections
 - Always `killall -9 harness web-host` before restarting to avoid orphan windows
@@ -233,17 +214,23 @@ lsof -ti:2341 | xargs kill -9
 lsof -ti:2342 | xargs kill -9
 ```
 
-`pkill -f` is unreliable because it may miss some process paths. Use `killall` by exact binary name. Always verify with `ps` and `lsof`.
+`pkill -f` is unreliable because it may miss some process paths. Use `killall` by exact
+binary name. Always verify with `ps` and `lsof`.
 
-### 7. Observation Handling in Web-Host IPC
+### 7. Intent Op Correlation & Validation
 
-The web-host's IPC handler receives `obs` messages with a nested structure:
-```rust
-"obs" => {
-    if let Some(data) = v.get("data") {
-        let d = data.get("data").and_then(|x| x.as_str())...
-        let l = data.get("label").and_then(|x| x.as_str())...
-    }
-}
-```
-The inner `data` and `label` come from the polyfill's `sendObservation(data, label)` — the outer `data` is the IPC message body.
+- Every intent op gets a unique `op_id` from the extension; the web-host echoes it through
+  the `intent-request` event's `requestId` and the app's `sendIntent` response, so responses
+  always correlate to the right awaiting tool call.
+- The web-host is the **authority** for validation (is the intent registered? does the
+  target app have the same type?). The extension's registry only fail-fasts on obvious
+  mistakes; real validation errors come back as `is_error` responses.
+- Dedupe registration announcements: an intent is announced to the agent the first time it
+  appears in an app; repeat transfers of the same `(app, type, id)` just refresh content
+  silently (`push_registration` checks `a.intents` first).
+
+### 8. Observation-Style Fields Grow Forever
+
+`intent_registrations`, `intent_unregistrations`, and `intent_responses` are never cleared;
+the harness tracks the last-forwarded index (like observations before them). Fine for
+development. `intent_ops` are the exception — the web-host clears them after dispatching.

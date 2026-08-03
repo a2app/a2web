@@ -1,35 +1,50 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-
 import { Type } from "typebox";
 import { connectToHarness, sendToHarness, onMessage } from "./doc-bridge.js";
-import { startHarness, stopHarness } from "./harness.js";
-import type { HarnessMessage, ObservationInfo } from "./types.js";
+import { startHarness } from "./harness.js";
+import type { HarnessMessage, IntentOp } from "./types.js";
 
 type ExtensionAPI = any;
-type AgentSession = any;
 
 let harnessStarted = false;
 let harnessReady: Promise<void> | null = null;
 
-// ── Sub-agent sessions ──────────────────────────────────────────────────
-interface SubSession { session: AgentSession; createdAt: number; }
-const subSessions = new Map<string, SubSession>();
-// app_id → session_id mapping
-const appSessionMap = new Map<string, string>();
+// ── Intent registry ─────────────────────────────────────────────────────
+// Mirrors the intents the agent has been told about (type + id only). Used
+// to fail fast on obviously invalid tool calls; the web-host is the final
+// authority and returns proper errors through intent_response messages.
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const SUB_AGENT_PROMPT = readFileSync(join(__dirname, "sub-agent-prompt.md"), "utf-8");
+const intentRegistry = new Map<string, Map<string, string>>();
 
-async function forwardObservationToSubAgent(sessionId: string, appId: string, data: string, label: string | null): Promise<void> {
-  const stored = subSessions.get(sessionId);
-  if (!stored) return;
-  try {
-    const msg = `[Observation from ${appId}]${label ? ` [${label}]` : ""}: ${data}`;
-    stored.session.prompt(msg, { expandPromptTemplates: false, streamingBehavior: 'followUp' }).catch((e: any) => console.error('[A2Web] sub-agent prompt error:', e));
-  } catch (e) { console.error('[A2Web] forward error:', e); }
+export function registerIntentInRegistry(appId: string, intentType: string, intentId: string): void {
+  let byId = intentRegistry.get(appId);
+  if (!byId) {
+    byId = new Map();
+    intentRegistry.set(appId, byId);
+  }
+  byId.set(intentId, intentType);
 }
+
+export function unregisterIntentInRegistry(appId: string, intentId: string): void {
+  const byId = intentRegistry.get(appId);
+  if (!byId) return;
+  byId.delete(intentId);
+  if (byId.size === 0) intentRegistry.delete(appId);
+}
+
+function knownIntent(appId: string, intentId: string): string | undefined {
+  return intentRegistry.get(appId)?.get(intentId);
+}
+
+function appHasIntentType(appId: string, intentType: string): boolean {
+  const byId = intentRegistry.get(appId);
+  if (!byId) return false;
+  for (const t of byId.values()) {
+    if (t === intentType) return true;
+  }
+  return false;
+}
+
+// ── Harness lifecycle ───────────────────────────────────────────────────
 
 export async function ensureConnected(): Promise<void> {
   if (harnessStarted) {
@@ -48,122 +63,170 @@ export async function ensureConnected(): Promise<void> {
   await harnessReady;
 }
 
-export function registerTools(pi: ExtensionAPI): void {
-  pi.registerTool({
-    name: "start_sub_agent",
-    label: "Start Sub-Agent",
-    description: "Create a sub-agent session. Returns a session_id. Webviews linked to this session send observations directly to it.",
-    parameters: Type.Object({
-      session_id: Type.Optional(Type.String({ description: "Optional custom session ID" })),
-    }),
-    async execute(_id: string, params: any) {
-      try {
-        const { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } =
-          await import("@earendil-works/pi-coding-agent");
-        const { defineTool } = await import("@earendil-works/pi-coding-agent");
-        const { tmpdir } = await import("node:os");
-        const { mkdirSync, existsSync } = await import("node:fs");
-        const { join } = await import("node:path");
+export function disposeExtensionState(): void {
+  intentRegistry.clear();
+}
 
-        // Tool for sub-agent to invoke webapp tools
-        const invokeTool = defineTool({
-          name: "invoke_webapp_tool", label: "Invoke WebApp Tool",
-          description: "Call a tool that a web app has registered. Provide app_id, tool_name, and JSON arguments. Waits for the result.",
-          parameters: Type.Object({ app_id: Type.String(), tool_name: Type.String(), arguments: Type.String() }),
-          execute: async (_id2: string, p: any) => {
-            try { await ensureConnected(); } catch { return { content: [{ type: "text", text: `Unavailable.` }], details: {}, isError: true }; }
-            const cid = `call-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-            sendToHarness({ type: "invoke_tool", call_id: cid, tool_name: p.tool_name, arguments: p.arguments, app_id: p.app_id });
-            // Wait for the result observation
-            return new Promise((resolve) => {
-              const to = setTimeout(() => resolve({ content: [{ type: "text", text: `Timeout waiting for ${p.tool_name} result.` }], details: {}, isError: true }), 20000);
-              const u = onMessage((m: any) => {
-                if (m.type === "observation" && m.app_id === p.app_id) {
-                  try {
-                    const d = JSON.parse(m.data);
-                    if (d.callId === cid || d.type === "counter") {
-                      clearTimeout(to); u();
-                      resolve({ content: [{ type: "text", text: m.data }], details: { app_id: p.app_id } });
-                    }
-                  } catch {}
-                }
-              });
-            });
-          },
-        });
+// ── Intent op plumbing ──────────────────────────────────────────────────
 
-        const blankDir = join(tmpdir(), "pi-a2web-" + process.pid);
-        if (!existsSync(blankDir)) mkdirSync(blankDir, { recursive: true });
-        const sm = SettingsManager.create(blankDir, blankDir);
-        const loader = new DefaultResourceLoader({
-          cwd: blankDir, agentDir: blankDir, settingsManager: sm,
-          noContextFiles: true, noSkills: true, noPromptTemplates: true, noThemes: true, noExtensions: true,
-          systemPromptOverride: () => SUB_AGENT_PROMPT,
-        });
-        await loader.reload();
-        const { session } = await createAgentSession({
-          resourceLoader: loader, sessionManager: SessionManager.inMemory(),
-          tools: ["invoke_webapp_tool"], customTools: [invokeTool],
-        });
+function errResult(text: string) {
+  return { content: [{ type: "text" as const, text }], details: {}, isError: true };
+}
+function okResult(text: string, details: Record<string, unknown> = {}) {
+  return { content: [{ type: "text" as const, text }], details, isError: false };
+}
 
-        const sessionId = params.session_id || `sub-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        subSessions.set(sessionId, { session, createdAt: Date.now() });
-        return { content: [{ type: "text", text: JSON.stringify({ session_id: sessionId }) }], details: { session_id: sessionId } };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Failed: ${err}` }], details: {}, isError: true };
-      }
-    },
+type ToolResult = ReturnType<typeof okResult | typeof errResult>;
+
+async function sendIntentOp(op: IntentOp): Promise<ToolResult> {
+  try {
+    await ensureConnected();
+  } catch {
+    return errResult("A2Web unavailable.");
+  }
+  const op_id = `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  sendToHarness({
+    type: "intent_op",
+    op_id,
+    kind: op.kind,
+    app_id: op.app_id,
+    intent_id: op.intent_id,
+    data: op.data ?? null,
+    target_app: op.target_app ?? null,
   });
 
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      resolve(
+        errResult(
+          `Timed out waiting for the intent response from app '${op.app_id}'. ` +
+            `The app may not handle 'intent-request' events.`,
+        ),
+      );
+    }, 20_000);
+
+    const unsub = onMessage((m: HarnessMessage) => {
+      if (m.type !== "intent_response" || m.op_id !== op_id) return;
+      clearTimeout(timeout);
+      unsub();
+      if (m.is_error) {
+        resolve(errResult(`Error: ${m.error ?? "unknown error"}`));
+      } else if (op.kind === "get" && m.data) {
+        resolve(okResult(m.data, { app_id: m.app_id, intent_id: m.intent_id }));
+      } else {
+        resolve(okResult(`Done.`, { app_id: m.app_id, intent_id: m.intent_id }));
+      }
+    });
+  });
+}
+
+// ── Tool registration ───────────────────────────────────────────────────
+
+export function registerTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "launch_webview",
     label: "Launch WebView",
-    description: "Launch a web app in a new native window (webview). The app HTML is fully rendered with a WebMCP polyfill.",
+    description:
+      "Launch a web app in a new native window (webview). The app HTML is fully rendered with the A2Web intent polyfill (document.modelContext.registerIntent etc.).",
     parameters: Type.Object({
-      app_id: Type.String({ description: "Unique ID" }),
-      html: Type.String({ description: "Full HTML document" }),
-      session_id: Type.Optional(Type.String({ description: "Sub-agent session to link" })),
+      app_id: Type.String({ description: "Unique ID for this app window" }),
+      html: Type.String({ description: "Full HTML document (body content is fine — the host wraps it)" }),
     }),
     async execute(_id: string, params: any) {
-      try { await ensureConnected(); } catch { return { content: [{ type: "text", text: `Unavailable.` }], details: {}, isError: true }; }
-      if (params.session_id) appSessionMap.set(params.app_id, params.session_id);
+      try {
+        await ensureConnected();
+      } catch {
+        return errResult("A2Web unavailable.");
+      }
       sendToHarness({ type: "launch_webview", app_id: params.app_id, html: params.html });
-      return { content: [{ type: "text", text: `Launched '${params.app_id}'.` }], details: { app_id: params.app_id } };
+      return okResult(`Launched '${params.app_id}'.`, { app_id: params.app_id });
     },
   });
 
   pi.registerTool({
-    name: "invoke_webapp_tool",
-    label: "Invoke WebApp Tool",
-    description: "Call a tool that a web app has registered.",
+    name: "get_intent",
+    label: "Get Intent Content",
+    description:
+      "Read the content of an intent held by a web app (for 'notes' intents: the title and content). Provide the app_id and the intent id. " +
+      "The intent must already be registered — you will have seen an '[A2Web] Intent registered' message in your context. " +
+      "Only call this when the user explicitly asks you to read an intent's content. " +
+      "Do NOT fetch content as part of a transfer between apps — use send_intent_to for that, which moves content app-to-app without exposing it to you.",
     parameters: Type.Object({
-      app_id: Type.String(), tool_name: Type.String(), arguments: Type.String(),
+      app: Type.String({ description: "app_id of the web app holding the intent" }),
+      id: Type.String({ description: "intent id" }),
     }),
     async execute(_id: string, params: any) {
-      try { await ensureConnected(); } catch { return { content: [{ type: "text", text: `Unavailable.` }], details: {}, isError: true }; }
-      sendToHarness({ type: "invoke_tool", call_id: `call-${Date.now()}`, tool_name: params.tool_name, arguments: params.arguments, app_id: params.app_id });
-      return { content: [{ type: "text", text: `Sent '${params.tool_name}' to '${params.app_id}'.` }], details: {} };
+      const type = knownIntent(params.app, params.id);
+      if (type === undefined && intentRegistry.has(params.app)) {
+        return errResult(`App '${params.app}' has no registered intent '${params.id}'.`);
+      }
+      return sendIntentOp({ kind: "get", app_id: params.app, intent_id: params.id });
     },
   });
-}
 
-export function disposeAllSessions(): void {
-  for (const [, s] of subSessions) {
-    try { s.session.dispose(); } catch {}
-  }
-  subSessions.clear();
-  appSessionMap.clear();
-}
-
-// ── Background: forward observations to linked sub-agents ───────────────
-
-export function startBackgroundListener(): void {
-  onMessage((msg: HarnessMessage) => {
-    if (msg.type === "observation") {
-      const sid = appSessionMap.get(msg.app_id);
-      if (sid) {
-        forwardObservationToSubAgent(sid, msg.app_id, msg.data, msg.label);
+  pi.registerTool({
+    name: "set_intent",
+    label: "Set Intent Content",
+    description:
+      "Write content into an intent held by a web app. Provide the app_id, the intent id, and the new content matching the intent's scheme " +
+      "(for 'notes': {\"title\": ..., \"content\": ...} — the id field is filled in automatically). " +
+      "The intent must already be registered. Only call this when the user explicitly asks you to write or update an intent's content.",
+    parameters: Type.Object({
+      app: Type.String({ description: "app_id of the web app holding the intent" }),
+      id: Type.String({ description: "intent id" }),
+      content: Type.Object(
+        {
+          title: Type.String({ description: "Note title" }),
+          content: Type.String({ description: "Note body text" }),
+        },
+        { additionalProperties: false },
+      ),
+    }),
+    async execute(_id: string, params: any) {
+      const type = knownIntent(params.app, params.id);
+      if (type === undefined && intentRegistry.has(params.app)) {
+        return errResult(`App '${params.app}' has no registered intent '${params.id}'.`);
       }
-    }
+      return sendIntentOp({
+        kind: "set",
+        app_id: params.app,
+        intent_id: params.id,
+        data: JSON.stringify(params.content),
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "send_intent_to",
+    label: "Send Intent To",
+    description:
+      "Clone an intent's content from one web app (src_app) into another web app (target_app). " +
+      "Both apps must have registered an intent of the same type (e.g. both 'notes'). " +
+      "The content is transferred directly between the two apps and is NEVER shown to you — " +
+      "after a successful transfer a new '[A2Web] Intent registered' message for the target app (same id, same type) appears in your context. " +
+      "Only call this when the user asks to move or copy content between apps.",
+    parameters: Type.Object({
+      src_app: Type.String({ description: "app_id of the app that currently holds the intent" }),
+      id: Type.String({ description: "intent id to clone from src_app" }),
+      target_app: Type.String({ description: "app_id of the app to receive the cloned intent" }),
+    }),
+    async execute(_id: string, params: any) {
+      const srcType = knownIntent(params.src_app, params.id);
+      if (srcType === undefined && intentRegistry.has(params.src_app)) {
+        return errResult(`App '${params.src_app}' has no registered intent '${params.id}'.`);
+      }
+      if (intentRegistry.has(params.target_app) && !appHasIntentType(params.target_app, srcType ?? "")) {
+        return errResult(
+          `App '${params.target_app}' has no intent of type '${srcType ?? "unknown"}' — ` +
+            `both apps must register the same intent type for a transfer.`,
+        );
+      }
+      return sendIntentOp({
+        kind: "transfer",
+        app_id: params.src_app,
+        intent_id: params.id,
+        target_app: params.target_app,
+      });
+    },
   });
 }

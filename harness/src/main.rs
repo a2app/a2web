@@ -10,7 +10,7 @@ use axum::Router;
 use futures::{SinkExt, StreamExt};
 use samod::{ConnDirection, DocHandle};
 use serde::{Deserialize, Serialize};
-use shared::{AgentDoc, PendingToolCall, WebViewStatus, JSON_WS_PORT, SAMOD_WS_PORT};
+use shared::{AgentDoc, PendingIntentOp, WebViewStatus, JSON_WS_PORT, SAMOD_WS_PORT};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -20,12 +20,14 @@ enum PiToHarnessMsg {
     LaunchWebView { app_id: String, html: String },
     #[serde(rename = "close_webview")]
     CloseWebView { app_id: String },
-    #[serde(rename = "invoke_tool")]
-    InvokeTool {
-        call_id: String,
-        tool_name: String,
-        arguments: String,
+    #[serde(rename = "intent_op")]
+    IntentOp {
+        op_id: String,
+        kind: String,
         app_id: String,
+        intent_id: String,
+        data: Option<String>,
+        target_app: Option<String>,
     },
     #[serde(rename = "exit")]
     Exit,
@@ -36,11 +38,31 @@ enum PiToHarnessMsg {
 enum HarnessToPiMsg {
     #[serde(rename = "welcome")]
     Welcome,
-    #[serde(rename = "observation")]
-    Observation {
+    /// An intent was registered — either by an app calling registerIntent or
+    /// by a transfer cloning an intent into the target app. Only type + id.
+    #[serde(rename = "intent_registered")]
+    IntentRegistered {
         app_id: String,
-        data: String,
-        label: Option<String>,
+        intent_type: String,
+        intent_id: String,
+    },
+    /// An intent was unregistered by an app (unregisterIntent call).
+    #[serde(rename = "intent_unregistered")]
+    IntentUnregistered {
+        app_id: String,
+        intent_type: String,
+        intent_id: String,
+    },
+    /// A queued intent op (get/set/transfer) was resolved by the web-host.
+    #[serde(rename = "intent_response")]
+    IntentResponse {
+        op_id: String,
+        kind: String,
+        app_id: String,
+        intent_id: String,
+        data: Option<String>,
+        is_error: bool,
+        error: Option<String>,
     },
 }
 
@@ -151,9 +173,11 @@ async fn background(headless: bool) {
         }
     });
 
-    // Bridge: forward new observations to pi
+    // Bridge: forward new intent registrations and op responses to pi.
     let mut changes = dh.changes();
-    let mut last_obs = 0usize;
+    let mut last_reg = 0usize;
+    let mut last_unreg = 0usize;
+    let mut last_resp = 0usize;
     while let Some(_) = changes.next().await {
         let exit = dh.with_document(|d| {
             use autosurgeon::hydrate;
@@ -163,31 +187,90 @@ async fn background(headless: bool) {
         if exit {
             break;
         }
-        let count = dh.with_document(|d| {
+
+        let reg_count = dh.with_document(|d| {
             use autosurgeon::hydrate;
             let a: AgentDoc = hydrate(d).unwrap_or_default();
-            a.observations.len()
+            a.intent_registrations.len()
         });
-        if count > last_obs {
-            let new_obs = dh.with_document(|d| {
+        if reg_count > last_reg {
+            let new_regs = dh.with_document(|d| {
                 use autosurgeon::hydrate;
                 let a: AgentDoc = hydrate(d).unwrap_or_default();
-                a.observations
+                a.intent_registrations
                     .iter()
-                    .skip(last_obs)
+                    .skip(last_reg)
                     .cloned()
                     .collect::<Vec<_>>()
             });
-            for o in &new_obs {
-                let msg = HarnessToPiMsg::Observation {
-                    app_id: o.app_id.clone(),
-                    data: o.data.clone(),
-                    label: o.label.clone(),
+            for r in &new_regs {
+                let msg = HarnessToPiMsg::IntentRegistered {
+                    app_id: r.app_id.clone(),
+                    intent_type: r.intent_type.clone(),
+                    intent_id: r.intent_id.clone(),
                 };
                 let json = serde_json::to_string(&msg).unwrap_or_default();
                 let _ = bridge.lock().await.pi_tx.send(json);
             }
-            last_obs = count;
+            last_reg = reg_count;
+        }
+
+        let unreg_count = dh.with_document(|d| {
+            use autosurgeon::hydrate;
+            let a: AgentDoc = hydrate(d).unwrap_or_default();
+            a.intent_unregistrations.len()
+        });
+        if unreg_count > last_unreg {
+            let new_unregs = dh.with_document(|d| {
+                use autosurgeon::hydrate;
+                let a: AgentDoc = hydrate(d).unwrap_or_default();
+                a.intent_unregistrations
+                    .iter()
+                    .skip(last_unreg)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            for r in &new_unregs {
+                let msg = HarnessToPiMsg::IntentUnregistered {
+                    app_id: r.app_id.clone(),
+                    intent_type: r.intent_type.clone(),
+                    intent_id: r.intent_id.clone(),
+                };
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                let _ = bridge.lock().await.pi_tx.send(json);
+            }
+            last_unreg = unreg_count;
+        }
+
+        let resp_count = dh.with_document(|d| {
+            use autosurgeon::hydrate;
+            let a: AgentDoc = hydrate(d).unwrap_or_default();
+            a.intent_responses.len()
+        });
+        if resp_count > last_resp {
+            let new_resps = dh.with_document(|d| {
+                use autosurgeon::hydrate;
+                let a: AgentDoc = hydrate(d).unwrap_or_default();
+                a.intent_responses
+                    .iter()
+                    .skip(last_resp)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            for r in &new_resps {
+                let msg = HarnessToPiMsg::IntentResponse {
+                    op_id: r.op_id.clone(),
+                    kind: r.kind.clone(),
+                    app_id: r.app_id.clone(),
+                    intent_id: r.intent_id.clone(),
+                    data: r.data.clone(),
+                    is_error: r.is_error,
+                    error: r.error.clone(),
+                };
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                let _ = bridge.lock().await.pi_tx.send(json);
+            }
+            last_resp = resp_count;
         }
     }
 }
@@ -246,24 +329,28 @@ async fn handle_pi(ws: AxumWs, bridge: Arc<Mutex<Bridge>>) {
                 use autosurgeon::{hydrate, reconcile};
                 let mut a: AgentDoc = hydrate(d).unwrap_or_default();
                 a.webviews.retain(|w| w.id != app_id);
-                a.registered_tools.retain(|t| t.app_id != app_id);
+                a.intents.retain(|i| i.app_id != app_id);
                 let mut t = d.transaction();
                 let _ = reconcile(&mut t, &a);
                 t.commit();
             }),
-            PiToHarnessMsg::InvokeTool {
-                call_id,
-                tool_name,
-                arguments,
+            PiToHarnessMsg::IntentOp {
+                op_id,
+                kind,
                 app_id,
+                intent_id,
+                data,
+                target_app,
             } => dh.with_document(|d| {
                 use autosurgeon::{hydrate, reconcile};
                 let mut a: AgentDoc = hydrate(d).unwrap_or_default();
-                a.tool_calls.push(PendingToolCall {
-                    id: call_id,
-                    tool_name,
-                    arguments,
+                a.intent_ops.push(PendingIntentOp {
+                    op_id,
+                    kind,
                     app_id,
+                    intent_id,
+                    data,
+                    target_app,
                 });
                 let mut t = d.transaction();
                 let _ = reconcile(&mut t, &a);
