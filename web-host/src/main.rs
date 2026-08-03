@@ -12,29 +12,32 @@ use tokio::runtime::Runtime;
 use wry::WebView;
 
 use shared::{
-    is_valid_intent_id, is_valid_intent_type, normalize_intent_data, AgentDoc, IntentRegistration,
-    IntentResponse, PendingIntentOp, RegisteredIntent, WebViewStatus, SAMOD_WS_PORT,
+    is_valid_entity_id, is_valid_intent_type, normalize_entity_data, Announcement,
+    AnnouncementKind, AgentDoc, EntityResponse, PendingEntityOp, RegisteredEntity,
+    RegisteredIntent, WebViewStatus, SAMOD_WS_PORT,
 };
 
 const WEBMCP: &str = include_str!("webmcp.js");
 const BRIDGE: &str = r#"(function(){
 var ipc = window.ipc, aid = window.__a2web.appId;
-window.__a2web.registerIntent = function(intent) { ipc.postMessage(JSON.stringify({type:'intent', appId:aid, intent:intent})); };
-window.__a2web.unregisterIntent = function(intent) { ipc.postMessage(JSON.stringify({type:'intent-unregister', appId:aid, intent:intent})); };
-window.__a2web.sendIntentContent = function(opId, intent) { ipc.postMessage(JSON.stringify({type:'intent-content', appId:aid, opId:opId, intent:intent})); };
+window.__a2web.registerIntent = function(i) { ipc.postMessage(JSON.stringify({type:'intent', appId:aid, intent:i})); };
+window.__a2web.unregisterIntent = function(i) { ipc.postMessage(JSON.stringify({type:'intent-unregister', appId:aid, intent:i})); };
+window.__a2web.registerEntity = function(e) { ipc.postMessage(JSON.stringify({type:'entity', appId:aid, entity:e})); };
+window.__a2web.unregisterEntity = function(e) { ipc.postMessage(JSON.stringify({type:'entity-unregister', appId:aid, entity:e})); };
+window.__a2web.sendEntityContent = function(opId, body) { ipc.postMessage(JSON.stringify({type:'entity-content', appId:aid, opId:opId, body:body})); };
 })();"#;
 
 #[derive(Debug)]
 enum HostEvent {
     WebAppLaunch { id: String, html: String },
-    /// A queued intent op from pi needs to be dispatched into a webview.
-    IntentOp { op: PendingIntentOp },
+    /// A queued entity op from pi needs to be dispatched into a webview.
+    EntityOp { op: PendingEntityOp },
     /// Content arrived from the source app of a transfer — deliver it to the
     /// target app now.
-    IntentContentReady {
+    EntityContentReady {
         op_id: String,
         intent_type: String,
-        intent_id: String,
+        entity_id: String,
         data: String,
     },
 }
@@ -65,20 +68,7 @@ fn read_doc<T>(dh: &Mutex<DocHandle>, f: impl FnOnce(&AgentDoc) -> T) -> Option<
     })
 }
 
-fn lookup_intent_type(dh: &Mutex<DocHandle>, app_id: &str, intent_id: &str) -> Option<String> {
-    read_doc(
-        dh,
-        |a| {
-            a.intents
-                .iter()
-                .find(|i| i.app_id == app_id && i.intent_id == intent_id)
-                .map(|i| i.intent_type.clone())
-        },
-    )
-    .flatten()
-}
-
-fn app_has_intent_type(dh: &Mutex<DocHandle>, app_id: &str, intent_type: &str) -> bool {
+fn app_has_intent(dh: &Mutex<DocHandle>, app_id: &str, intent_type: &str) -> bool {
     read_doc(
         dh,
         |a| a.intents.iter().any(|i| i.app_id == app_id && i.intent_type == intent_type),
@@ -86,13 +76,26 @@ fn app_has_intent_type(dh: &Mutex<DocHandle>, app_id: &str, intent_type: &str) -
     .unwrap_or(false)
 }
 
-fn write_response(dh: &Mutex<DocHandle>, op: &PendingIntentOp, data: Option<String>) {
+fn app_has_entity(dh: &Mutex<DocHandle>, app_id: &str, intent_type: &str, entity_id: &str) -> bool {
+    read_doc(
+        dh,
+        |a| {
+            a.entities.iter().any(|e| {
+                e.app_id == app_id && e.intent_type == intent_type && e.entity_id == entity_id
+            })
+        },
+    )
+    .unwrap_or(false)
+}
+
+fn write_response(dh: &Mutex<DocHandle>, op: &PendingEntityOp, data: Option<String>) {
     with_doc(dh, |a| {
-        a.intent_responses.push(IntentResponse {
+        a.entity_responses.push(EntityResponse {
             op_id: op.op_id.clone(),
             kind: op.kind.clone(),
             app_id: op.app_id.clone(),
-            intent_id: op.intent_id.clone(),
+            intent_type: op.intent_type.clone(),
+            entity_id: op.entity_id.clone(),
             data,
             is_error: false,
             error: None,
@@ -100,13 +103,14 @@ fn write_response(dh: &Mutex<DocHandle>, op: &PendingIntentOp, data: Option<Stri
     });
 }
 
-fn write_error(dh: &Mutex<DocHandle>, op: &PendingIntentOp, error: &str) {
+fn write_error(dh: &Mutex<DocHandle>, op: &PendingEntityOp, error: &str) {
     with_doc(dh, |a| {
-        a.intent_responses.push(IntentResponse {
+        a.entity_responses.push(EntityResponse {
             op_id: op.op_id.clone(),
             kind: op.kind.clone(),
             app_id: op.app_id.clone(),
-            intent_id: op.intent_id.clone(),
+            intent_type: op.intent_type.clone(),
+            entity_id: op.entity_id.clone(),
             data: None,
             is_error: true,
             error: Some(error.to_string()),
@@ -114,26 +118,65 @@ fn write_error(dh: &Mutex<DocHandle>, op: &PendingIntentOp, error: &str) {
     });
 }
 
-fn push_registration(dh: &Mutex<DocHandle>, app_id: &str, intent_type: &str, intent_id: &str) {
+/// Announce a registration change to the agent context. Registered
+/// announcements are deduped — an intent/entity is announced only the first
+/// time it appears; later refreshes stay silent.
+fn push_announcement(
+    dh: &Mutex<DocHandle>,
+    kind: AnnouncementKind,
+    app_id: &str,
+    intent_type: &str,
+    entity_id: Option<&str>,
+) {
     with_doc(dh, |a| {
-        // Announce an intent in an app only the first time it appears. Later
-        // transfers of the same (app, type, id) just refresh the content
-        // silently — no duplicate registry entry or context noise.
-        let already = a.intents.iter().any(|i| {
-            i.app_id == app_id && i.intent_type == intent_type && i.intent_id == intent_id
-        });
-        if already {
+        let dup = match kind {
+            AnnouncementKind::IntentRegistered => a
+                .intents
+                .iter()
+                .any(|i| i.app_id == app_id && i.intent_type == intent_type),
+            AnnouncementKind::EntityRegistered => a.entities.iter().any(|e| {
+                e.app_id == app_id
+                    && e.intent_type == intent_type
+                    && e.entity_id == entity_id.unwrap_or("")
+            }),
+            _ => false,
+        };
+        if dup {
             return;
         }
-        a.intents.push(RegisteredIntent {
+        // Keep the system-side registry in sync with what gets announced.
+        match kind {
+            AnnouncementKind::IntentRegistered => {
+                a.intents.push(RegisteredIntent {
+                    app_id: app_id.to_string(),
+                    intent_type: intent_type.to_string(),
+                });
+            }
+            AnnouncementKind::IntentUnregistered => {
+                a.intents.retain(|i| !(i.app_id == app_id && i.intent_type == intent_type));
+            }
+            AnnouncementKind::EntityRegistered => {
+                if let Some(eid) = entity_id {
+                    a.entities.push(RegisteredEntity {
+                        app_id: app_id.to_string(),
+                        intent_type: intent_type.to_string(),
+                        entity_id: eid.to_string(),
+                    });
+                }
+            }
+            AnnouncementKind::EntityUnregistered => {
+                if let Some(eid) = entity_id {
+                    a.entities.retain(|e| {
+                        !(e.app_id == app_id && e.intent_type == intent_type && e.entity_id == eid)
+                    });
+                }
+            }
+        }
+        a.announcements.push(Announcement {
+            kind,
             app_id: app_id.to_string(),
             intent_type: intent_type.to_string(),
-            intent_id: intent_id.to_string(),
-        });
-        a.intent_registrations.push(IntentRegistration {
-            app_id: app_id.to_string(),
-            intent_type: intent_type.to_string(),
-            intent_id: intent_id.to_string(),
+            entity_id: entity_id.map(String::from),
         });
     });
 }
@@ -144,7 +187,7 @@ fn main() {
     let (doc_tx, doc_rx) = std::sync::mpsc::channel::<DocHandle>();
 
     let pending_launches: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    let pending_ops: Arc<Mutex<HashMap<String, PendingIntentOp>>> =
+    let pending_ops: Arc<Mutex<HashMap<String, PendingEntityOp>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     let pl = pending_launches.clone();
@@ -200,12 +243,12 @@ fn main() {
                     }
                 });
 
-                // 2) Dispatch queued intent ops (skip ones already pending)
-                let ops: Vec<PendingIntentOp> = handle.with_document(|doc| {
+                // 2) Dispatch queued entity ops (skip ones already pending)
+                let ops: Vec<PendingEntityOp> = handle.with_document(|doc| {
                     use autosurgeon::hydrate;
                     let a: AgentDoc = hydrate(doc).unwrap_or_default();
                     let pending = ppo.lock().unwrap();
-                    a.intent_ops
+                    a.entity_ops
                         .iter()
                         .filter(|o| !pending.contains_key(&o.op_id))
                         .cloned()
@@ -220,16 +263,16 @@ fn main() {
                         }
                     }
                     for op in &ops {
-                        let _ = pproxy.send_event(HostEvent::IntentOp { op: op.clone() });
+                        let _ = pproxy.send_event(HostEvent::EntityOp { op: op.clone() });
                     }
                     // Remove dispatched ops from the queue so they don't
                     // accumulate (the pending_ops map guards re-dispatch).
                     handle.with_document(|doc| {
                         use autosurgeon::{hydrate, reconcile};
                         let mut a: AgentDoc = hydrate(doc).unwrap_or_default();
-                        let before = a.intent_ops.len();
-                        a.intent_ops.retain(|o| !ids.contains(&o.op_id));
-                        if a.intent_ops.len() != before {
+                        let before = a.entity_ops.len();
+                        a.entity_ops.retain(|o| !ids.contains(&o.op_id));
+                        if a.entity_ops.len() != before {
                             let mut t = doc.transaction();
                             let _ = reconcile(&mut t, &a);
                             t.commit();
@@ -266,86 +309,146 @@ fn main() {
                                 let typ = v.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
                                 let aid = v.get("appId").and_then(|x| x.as_str()).unwrap_or("webapp").to_string();
                                 match typ.as_str() {
-                                    // App registered an intent: {type, id} — no content.
+                                    // App registered an intent capability: {type}
                                     "intent" => {
                                         if let Some(intent) = v.get("intent") {
                                             let itype = intent.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                                            let iid = intent.get("id").and_then(|x| x.as_str()).unwrap_or("");
-                                            if is_valid_intent_type(itype) && is_valid_intent_id(iid) {
+                                            if is_valid_intent_type(itype) {
                                                 let exists = read_doc(&dh, |a| {
                                                     a.intents.iter().any(|i| {
-                                                        i.app_id == aid && i.intent_type == itype && i.intent_id == iid
+                                                        i.app_id == aid && i.intent_type == itype
                                                     })
                                                 })
                                                 .unwrap_or(false);
                                                 if !exists {
-                                                    with_doc(&dh, |a| {
-                                                        a.intents.push(RegisteredIntent {
-                                                            app_id: aid.clone(),
-                                                            intent_type: itype.to_string(),
-                                                            intent_id: iid.to_string(),
-                                                        });
-                                                        a.intent_registrations.push(IntentRegistration {
-                                                            app_id: aid.clone(),
-                                                            intent_type: itype.to_string(),
-                                                            intent_id: iid.to_string(),
-                                                        });
-                                                    });
+                                                    push_announcement(
+                                                        &dh,
+                                                        AnnouncementKind::IntentRegistered,
+                                                        &aid,
+                                                        itype,
+                                                        None,
+                                                    );
                                                 }
                                             }
                                         }
                                     }
-                                    // App unregistered an intent — remove from the
-                                    // registry and announce the removal to the agent.
                                     "intent-unregister" => {
                                         if let Some(intent) = v.get("intent") {
                                             let itype = intent.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                                            let iid = intent.get("id").and_then(|x| x.as_str()).unwrap_or("");
-                                            with_doc(&dh, |a| {
-                                                a.intents.retain(|i| {
-                                                    !(i.app_id == aid && i.intent_type == itype && i.intent_id == iid)
-                                                });
-                                                a.intent_unregistrations.push(IntentRegistration {
-                                                    app_id: aid.clone(),
-                                                    intent_type: itype.to_string(),
-                                                    intent_id: iid.to_string(),
-                                                });
-                                            });
+                                            push_announcement(
+                                                &dh,
+                                                AnnouncementKind::IntentUnregistered,
+                                                &aid,
+                                                itype,
+                                                None,
+                                            );
                                         }
                                     }
-                                    // App answered an 'intent-request' with content.
-                                    "intent-content" => {
+                                    // App registered an entity: {type, id}
+                                    "entity" => {
+                                        if let Some(entity) = v.get("entity") {
+                                            let itype = entity.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                                            let eid = entity.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                                            if is_valid_intent_type(itype)
+                                                && is_valid_entity_id(eid)
+                                                && app_has_intent(&dh, &aid, itype)
+                                            {
+                                                let exists = read_doc(&dh, |a| {
+                                                    a.entities.iter().any(|e| {
+                                                        e.app_id == aid
+                                                            && e.intent_type == itype
+                                                            && e.entity_id == eid
+                                                    })
+                                                })
+                                                .unwrap_or(false);
+                                                if !exists {
+                                                    push_announcement(
+                                                        &dh,
+                                                        AnnouncementKind::EntityRegistered,
+                                                        &aid,
+                                                        itype,
+                                                        Some(eid),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    "entity-unregister" => {
+                                        if let Some(entity) = v.get("entity") {
+                                            let itype = entity.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                                            let eid = entity.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                                            push_announcement(
+                                                &dh,
+                                                AnnouncementKind::EntityUnregistered,
+                                                &aid,
+                                                itype,
+                                                Some(eid),
+                                            );
+                                        }
+                                    }
+                                    // App answered an 'entity-request' with content.
+                                    "entity-content" => {
                                         let op_id = v.get("opId").and_then(|x| x.as_str()).unwrap_or("").to_string();
                                         if op_id.is_empty() {
                                             return;
                                         }
-                                        let intent = v.get("intent").cloned().unwrap_or(serde_json::Value::Null);
-                                        let itype = intent.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                                        let iid = intent.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                                        let data = intent.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                                        let body = v.get("body").cloned().unwrap_or(serde_json::Value::Null);
+                                        let itype = body.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                        let entities = body
+                                            .get("entities")
+                                            .and_then(|x| x.as_array())
+                                            .cloned()
+                                            .unwrap_or_default();
                                         let pending = pending_ops.lock().unwrap().get(&op_id).cloned();
                                         if let Some(op) = pending {
-                                            let norm = normalize_intent_data(&iid, &data);
+                                            // Normalize each entity's content against the scheme.
+                                            let mut normed: Vec<serde_json::Value> = Vec::new();
+                                            let mut bad = false;
+                                            for e in &entities {
+                                                let eid = e.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                                                let data = e.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                                                match normalize_entity_data(eid, &data) {
+                                                    Some(n) => normed.push(n),
+                                                    None => { bad = true; break; }
+                                                }
+                                            }
+                                            if entities.is_empty() && op.kind != "list" {
+                                                bad = true;
+                                            }
                                             match op.kind.as_str() {
-                                                "get" => {
-                                                    if let Some(n) = norm {
-                                                        write_response(&dh, &op, Some(n.to_string()));
+                                                "list" => {
+                                                    if bad {
+                                                        write_error(&dh, &op, "invalid entity content for intent scheme");
                                                     } else {
-                                                        write_error(&dh, &op, "invalid content for intent scheme");
+                                                        let arr = serde_json::Value::Array(normed);
+                                                        write_response(&dh, &op, Some(arr.to_string()));
+                                                    }
+                                                    pending_ops.lock().unwrap().remove(&op_id);
+                                                }
+                                                "read" => {
+                                                    if bad || normed.is_empty() {
+                                                        write_error(&dh, &op, "invalid entity content for intent scheme");
+                                                    } else {
+                                                        write_response(&dh, &op, Some(normed[0].to_string()));
                                                     }
                                                     pending_ops.lock().unwrap().remove(&op_id);
                                                 }
                                                 "transfer" => {
-                                                    if let Some(n) = norm {
-                                                        let _ = proxy.send_event(HostEvent::IntentContentReady {
+                                                    if bad || normed.is_empty() {
+                                                        write_error(&dh, &op, "invalid entity content for intent scheme");
+                                                        pending_ops.lock().unwrap().remove(&op_id);
+                                                    } else {
+                                                        let entity_id = normed[0]
+                                                            .get("id")
+                                                            .and_then(|x| x.as_str())
+                                                            .unwrap_or("")
+                                                            .to_string();
+                                                        let _ = proxy.send_event(HostEvent::EntityContentReady {
                                                             op_id: op_id.clone(),
                                                             intent_type: itype,
-                                                            intent_id: iid,
-                                                            data: n.to_string(),
+                                                            entity_id,
+                                                            data: normed[0].to_string(),
                                                         });
-                                                    } else {
-                                                        write_error(&dh, &op, "invalid content for intent scheme");
-                                                        pending_ops.lock().unwrap().remove(&op_id);
                                                     }
                                                 }
                                                 _ => {}
@@ -383,27 +486,37 @@ fn main() {
                 views.insert(wid, (win, wv, id));
             }
 
-            Event::UserEvent(HostEvent::IntentOp { op }) => {
-                // Resolve the intent's type from the registry; also validates
-                // that the app actually registered this intent.
-                let intent_type = match lookup_intent_type(&dh, &op.app_id, &op.intent_id) {
-                    Some(t) => t,
-                    None => {
-                        write_error(&dh, &op, "no intent with this id is registered in the app");
-                        pending_ops.lock().unwrap().remove(&op.op_id);
-                        return;
-                    }
-                };
-
+            Event::UserEvent(HostEvent::EntityOp { op }) => {
                 match op.kind.as_str() {
-                    "get" | "transfer" => {
+                    "list" => {
+                        if !app_has_intent(&dh, &op.app_id, &op.intent_type) {
+                            write_error(&dh, &op, "app has no such intent");
+                            pending_ops.lock().unwrap().remove(&op.op_id);
+                            return;
+                        }
+                        if let Some((_, wv, _)) = views.values().find(|(_, _, a)| *a == op.app_id) {
+                            let _ = wv.evaluate_script(&format!(
+                                r#"document.dispatchEvent(new CustomEvent('entity-request', {{ detail: {{ requestId: {:?}, type: {:?}, id: "", mode: "list" }} }}));"#,
+                                op.op_id, op.intent_type
+                            ));
+                        } else {
+                            write_error(&dh, &op, "app window not found");
+                            pending_ops.lock().unwrap().remove(&op.op_id);
+                        }
+                    }
+                    "read" | "transfer" => {
+                        if !app_has_entity(&dh, &op.app_id, &op.intent_type, &op.entity_id) {
+                            write_error(&dh, &op, "no entity with this id is registered in the app");
+                            pending_ops.lock().unwrap().remove(&op.op_id);
+                            return;
+                        }
                         if op.kind == "transfer" {
                             let target = op.target_app.clone().unwrap_or_default();
-                            if !app_has_intent_type(&dh, &target, &intent_type) {
+                            if !app_has_intent(&dh, &target, &op.intent_type) {
                                 write_error(
                                     &dh,
                                     &op,
-                                    &format!("target app '{}' has no intent of type '{}'", target, intent_type),
+                                    &format!("target app '{}' does not handle intent '{}'", target, op.intent_type),
                                 );
                                 pending_ops.lock().unwrap().remove(&op.op_id);
                                 return;
@@ -411,8 +524,8 @@ fn main() {
                         }
                         if let Some((_, wv, _)) = views.values().find(|(_, _, a)| *a == op.app_id) {
                             let _ = wv.evaluate_script(&format!(
-                                r#"document.dispatchEvent(new CustomEvent('intent-request', {{ detail: {{ requestId: {:?}, type: {:?}, id: {:?} }} }}));"#,
-                                op.op_id, intent_type, op.intent_id
+                                r#"document.dispatchEvent(new CustomEvent('entity-request', {{ detail: {{ requestId: {:?}, type: {:?}, id: {:?}, mode: {:?} }} }}));"#,
+                                op.op_id, op.intent_type, op.entity_id, op.kind
                             ));
                         } else {
                             write_error(&dh, &op, "app window not found");
@@ -420,18 +533,23 @@ fn main() {
                         }
                     }
                     "set" => {
+                        if !app_has_entity(&dh, &op.app_id, &op.intent_type, &op.entity_id) {
+                            write_error(&dh, &op, "no entity with this id is registered in the app");
+                            pending_ops.lock().unwrap().remove(&op.op_id);
+                            return;
+                        }
                         let data = op
                             .data
                             .as_deref()
                             .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok());
-                        let norm = data.as_ref().and_then(|d| normalize_intent_data(&op.intent_id, d));
+                        let norm = data.as_ref().and_then(|d| normalize_entity_data(&op.entity_id, d));
                         match norm {
                             Some(content) => {
                                 if let Some((_, wv, _)) = views.values().find(|(_, _, a)| *a == op.app_id) {
                                     let data_json = content.to_string();
                                     let _ = wv.evaluate_script(&format!(
-                                        r#"document.dispatchEvent(new CustomEvent('intent-receive', {{ detail: {{ type: {:?}, id: {:?}, data: {}, source: {:?} }} }}));"#,
-                                        intent_type, op.intent_id, data_json, "agent"
+                                        r#"document.dispatchEvent(new CustomEvent('entity-receive', {{ detail: {{ type: {:?}, id: {:?}, data: {}, source: {:?} }} }}));"#,
+                                        op.intent_type, op.entity_id, data_json, "agent"
                                     ));
                                     write_response(&dh, &op, None);
                                 } else {
@@ -439,33 +557,39 @@ fn main() {
                                 }
                             }
                             None => {
-                                write_error(&dh, &op, "invalid content for intent scheme");
+                                write_error(&dh, &op, "invalid entity content for intent scheme");
                             }
                         }
                         pending_ops.lock().unwrap().remove(&op.op_id);
                     }
                     _ => {
-                        write_error(&dh, &op, "unknown intent op kind");
+                        write_error(&dh, &op, "unknown entity op kind");
                         pending_ops.lock().unwrap().remove(&op.op_id);
                     }
                 }
             }
 
-            Event::UserEvent(HostEvent::IntentContentReady { op_id, intent_type, intent_id, data }) => {
+            Event::UserEvent(HostEvent::EntityContentReady { op_id, intent_type, entity_id, data }) => {
                 // Content from the source app of a transfer. Clone it into the
-                // target app, announce the cloned intent to the agent context,
+                // target app, announce the cloned entity to the agent context,
                 // and resolve the op.
                 let pending = pending_ops.lock().unwrap().get(&op_id).cloned();
                 if let Some(op) = pending {
                     let target = op.target_app.clone().unwrap_or_default();
                     if let Some((_, wv, _)) = views.values().find(|(_, _, a)| *a == target) {
                         let _ = wv.evaluate_script(&format!(
-                            r#"document.dispatchEvent(new CustomEvent('intent-receive', {{ detail: {{ type: {:?}, id: {:?}, data: {}, source: {:?} }} }}));"#,
-                            intent_type, intent_id, data, "transfer"
+                            r#"document.dispatchEvent(new CustomEvent('entity-receive', {{ detail: {{ type: {:?}, id: {:?}, data: {}, source: {:?} }} }}));"#,
+                            intent_type, entity_id, data, "transfer"
                         ));
-                        // The cloned intent now lives in the target app — update
-                        // the agent context (type + id only, content stays app-side).
-                        push_registration(&dh, &target, &intent_type, &intent_id);
+                        // The cloned entity now lives in the target app —
+                        // announce it (type + id only, content stays app-side).
+                        push_announcement(
+                            &dh,
+                            AnnouncementKind::EntityRegistered,
+                            &target,
+                            &intent_type,
+                            Some(&entity_id),
+                        );
                         write_response(&dh, &op, None);
                     } else {
                         write_error(&dh, &op, "target app window not found");
@@ -479,10 +603,11 @@ fn main() {
                     with_doc(&dh, |a| {
                         a.webviews.retain(|w| w.id != app_id);
                         a.intents.retain(|i| i.app_id != app_id);
+                        a.entities.retain(|e| e.app_id != app_id);
                     });
                     // Fail any pending ops for this app so the agent isn't left hanging.
                     let mut pending = pending_ops.lock().unwrap();
-                    let to_fail: Vec<PendingIntentOp> = pending
+                    let to_fail: Vec<PendingEntityOp> = pending
                         .iter()
                         .filter(|(_, op)| op.app_id == app_id || op.target_app.as_deref() == Some(&app_id))
                         .map(|(_, op)| op.clone())
